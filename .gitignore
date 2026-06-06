@@ -1,0 +1,7 @@
+.env
+pdfs/
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+.claude/settings.local.json
