@@ -136,7 +136,7 @@ SCREEN_MODEL=deepseek-v4-flash          # 默认值，可按需修改
 
 ---
 
-## Claude Code skill
+## Claude Code 自定义技能
 
 本工作流包含以下 Claude Code 自定义技能（位于 `.claude/skills/` 目录），在 Claude Code 会话中直接使用斜杠命令调用：
 
@@ -294,6 +294,77 @@ Manual step after running:
   (Zotero auto-creates a collection named "included_papers" — rename it to your project name after import)
 ```
 
+### 步骤 2e — 生成 pdf_map.csv 并从 Zotero 复制 PDF
+
+此步骤在 2d 完成（Zotero 导入后）、Phase 3 提取开始**之前**运行。它生成 `pdfs/pdf_map.csv`（`batch_extract.py` 用于定位 PDF 的映射表），并将 PDF 从 Zotero 本地存储复制到 `pdfs/` 目录。
+
+> **前提**：PDF 必须已在 Zotero 中附加完毕（手动下载，或通过 Zotero 右键 → Find Available PDF 批量获取）。仅支持 `imported_file` 类型附件（存储在 Zotero storage 目录内）；`linked_file` 类型不受支持。
+
+```
+Read CLAUDE.md.
+Write scripts/copy_pdfs_from_zotero.py that builds pdfs/pdf_map.csv and copies
+PDF attachments from Zotero local storage. Zotero must be running.
+
+STEP 1 — Discover Zotero user ID and collection key:
+- Call http://localhost:23119/api/ (GET, no auth needed for local API)
+  Parse the first userId from the response JSON.
+- GET http://localhost:23119/api/users/{userId}/collections?format=json&limit=100
+  Find the collection whose data.name == "DigitalTwins-Cancer-Review"
+  (make the collection name configurable via a ZOTERO_COLLECTION env var with this as default).
+  Extract its collectionKey.
+
+STEP 2 — Retrieve all parent items in the collection:
+- GET http://localhost:23119/api/users/{userId}/collections/{collectionKey}/items
+      ?format=json&include=data&itemType=-attachment-note&limit=100&start=0
+  Handle pagination: increment start by 100 until fewer than 100 items are returned.
+  Keep only items whose data.itemType is journalArticle, preprint, report,
+  conferencePaper, or thesis.
+
+STEP 3 — Per-item: extract identifiers and find PDF attachment:
+For each parent item:
+  a. PMID: search data.extra for a line matching "PMID: (\d+)" (case-insensitive);
+     also try data.get("pmid", ""). Strip whitespace. Empty string if not found.
+  b. DOI: data.get("DOI", ""). Normalize: lowercase, strip leading
+     "https://doi.org/" or "http://dx.doi.org/". Empty string if not found.
+  c. Fetch children:
+       GET http://localhost:23119/api/users/{userId}/items/{itemKey}/children?format=json
+  d. Find the first child where:
+       data.contentType == "application/pdf"
+       AND data.linkMode == "imported_file"
+     If no such child exists, record the item with empty att_key and pdf_filename.
+
+STEP 4 — Copy the PDF to pdfs/:
+  - att_key = attachment item key (e.g. "WW3JGA3J")
+  - Locate Zotero storage directory (try in order):
+      Windows: %USERPROFILE%\Zotero\storage
+               %APPDATA%\Zotero\Zotero\storage
+               %LOCALAPPDATA%\Zotero\storage
+      macOS:   ~/Zotero/storage
+               ~/Library/Application Support/Zotero/storage
+    Use the first path that exists as a directory.
+    Allow override via ZOTERO_STORAGE env var.
+  - Source: {zotero_storage}/{att_key}/{attachment.data.filename}
+  - dest_filename: f"{att_key}_{attachment.data.filename}"
+    (prefix with att_key to guarantee uniqueness across papers with identical filenames)
+  - Destination: pdfs/{dest_filename}
+  - Skip copy if destination already exists (idempotent).
+  - If source file does not exist on disk, log a warning and leave pdf_filename as
+    the expected dest_filename anyway (the PDF may not have been downloaded yet).
+
+STEP 5 — Write pdfs/pdf_map.csv:
+  Columns (in order): PMID, DOI, att_key, pdf_filename
+  - Include ALL parent items, even those without a PDF (empty att_key / pdf_filename).
+  - Encoding: utf-8-sig (so Excel opens correctly on Windows).
+
+After writing, print:
+  Total items in collection / PDFs found in Zotero storage /
+  PDFs copied (new) / PDFs skipped (already present) /
+  Items without any PDF attachment / Items where source file missing on disk
+
+Add retry logic (3 attempts, 0.5 s delay) for each HTTP request.
+Run with: uv run python scripts/copy_pdfs_from_zotero.py
+```
+
 ---
 
 ## 阶段三：资料提取
@@ -304,40 +375,60 @@ Manual step after running:
 
 ```
 Read CLAUDE.md.
-Write scripts/batch_extract.py for all Score=2 papers in screening/final_screened.csv.
+Write scripts/batch_extract.py that processes all Score=2 papers from screening/final_screened.csv as follows:
 
-SETUP: Load final_screened.csv, pdfs/pdf_map.csv, and search/pubmed_results.csv (latin-1);
-join on PMID/DOI. Resume-safe: skip papers whose DOI already appears in any extractions/*.md.
+SETUP:
+- Load final_screened.csv (Score=2), pdfs/pdf_map.csv (DOI→pdf_filename mapping),
+  and search/pubmed_results.csv (encoding latin-1, for Authors and Abstract)
+- Join all three on PMID/DOI to build a per-paper record
+- On startup, scan extractions/ for existing .md files; read the DOI line from each
+  and skip any paper whose DOI is already extracted (resume-safe)
 
-PER-PAPER:
-- PDF found in pdfs/: extract with pymupdf; parse major sections via regex on section
-  headers; fall back to first/last N chars if a section is missing. Source = "Full text PDF".
-- No PDF: use Abstract from pubmed_results.csv. Source = "Abstract only".
+PER-PAPER LOGIC:
+- If pdf_filename is present in pdf_map.csv and the file exists in pdfs/:
+    Use pymupdf (fitz) to extract full text; detect section boundaries for
+    Introduction, Methods, Results, and Conclusion/Discussion using regex on section headers;
+    if a section is not found fall back to first/last N chars of the full text.
+    Set Text source = "Full text PDF"
+- Otherwise:
+    Use the Abstract from pubmed_results.csv.
+    Set Text source = "Abstract only"
 
-EXTRACTION INSTRUCTION (pass verbatim to model):
-"Capture exact metric values (AUC, C-index, accuracy, etc.), specific dataset names, and
-patient counts. Name the specific model/framework rather than a generic category.
-Record whether validation was internal, external, or prospective."
+For each paper, call DeepSeek API (OpenAI-compatible, same pattern as batch_screen.py)
+with the extracted text and paper metadata.
 
-Return JSON with fields:
-  paper_type, subject_tags, in_scope_score,
+EXTRACTION INSTRUCTION (pass this to the model):
+  "For every claim, capture the exact metric value (AUC, C-index, accuracy), the
+   specific dataset name, and patient count — these will be needed for dense in-text
+   citation in the manuscript. Prefer concrete numbers over qualitative descriptions.
+   Name the specific model/framework (e.g. 'MIFAPS', 'mSTAR', 'G-HANet') rather than a
+   generic category. Record whether validation was internal, external, or prospective."
+
+Return a JSON object with fields:
+  paper_type, modalities, cancer_types, in_scope_score (1/2/3),
   framework, architecture_name, key_techniques,
-  datasets, datasets_detail [{name, n_patients, institution}],
-  validation, validation_type, key_metrics [{metric, value, dataset, n}],
-  key_findings, limitations, sections_fed, key_claim, conflicts
-
-Render into extractions/{FirstAuthorYear}.md using the Extraction Note Format in CLAUDE.md,
-plus this section appended after Methods:
+  datasets, datasets_detail (list of {name, n_patients, institution}),
+  validation, validation_type (internal / external / prospective),
+  key_metrics (list of {metric, value, dataset, n}),
+  key_findings (list of 2–4 strings), limitations,
+  sections_fed, key_claim, conflicts
+Render the JSON into extractions/{FirstAuthorYear}.md following the
+Extraction Note Format template in CLAUDE.md, including the
+## Quantitative Evidence section:
   ## Quantitative Evidence
   - **Architecture name:** {architecture_name}
   - **Validation type:** {validation_type}
   - **Datasets (name · n patients · institution):** {datasets_detail}
   - **Key metrics (metric · value · dataset · n):** {key_metrics}
 
-API: DeepSeek, OpenAI-compatible, same pattern as batch_screen.py.
-.env: DEEPSEEK_API_KEY (required), SCREEN_MODEL (default: deepseek-v4-flash).
+OUTPUT:
+- One .md file per paper in extractions/
+- Print progress per paper and a final summary: from PDF / from abstract / errors
 
-Print per-paper progress and final summary: from PDF / from abstract / errors.
+.env variables:
+  DEEPSEEK_API_KEY   — required
+  EXTRACT_MODEL      — model name (default: deepseek-chat)
+
 Run with: uv run python scripts/batch_extract.py
 ```
 
